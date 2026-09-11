@@ -1,0 +1,341 @@
+name: Sync My ZcashGH Work
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "What should be synchronized?"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - open
+          - closed
+
+  schedule:
+    - cron: "*/59 * * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    env:
+      SOURCE_REPO: ZOERDHUB/ZcashGH-Residency01
+      DEST_REPO: starlabman/ZcashGH-Residency01
+      GH_USER: starlabman
+
+    steps:
+
+      # ---------------------------------------------------------
+      # 1. Checkout destination repository
+      # ---------------------------------------------------------
+
+      - name: Checkout destination repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_SYNC_TOKEN }}
+
+      # ---------------------------------------------------------
+      # 2. Configure Git
+      # ---------------------------------------------------------
+
+      - name: Configure Git
+        run: |
+          git config user.name "starlabman"
+          git config user.email "41898282+starlabman@users.noreply.github.com"
+
+      # ---------------------------------------------------------
+      # 3. Configure GitHub CLI
+      # ---------------------------------------------------------
+
+      - name: Verify GitHub authentication
+        env:
+          GH_TOKEN: ${{ secrets.GH_SYNC_TOKEN }}
+        run: |
+          gh auth status
+          gh api user --jq '.login'
+
+      # ---------------------------------------------------------
+      # 4. Add source repository
+      # ---------------------------------------------------------
+
+      - name: Add source repository
+        run: |
+          git remote remove source 2>/dev/null || true
+          git remote add source https://github.com/${SOURCE_REPO}.git
+
+      # ---------------------------------------------------------
+      # 5. Synchronize my PRs
+      # ---------------------------------------------------------
+
+      - name: Synchronize my pull requests
+        env:
+          GH_TOKEN: ${{ secrets.GH_SYNC_TOKEN }}
+          MODE: ${{ github.event.inputs.mode || 'all' }}
+        shell: bash
+        run: |
+
+          set -euo pipefail
+
+          echo "=========================================="
+          echo "ZcashGH Personal Work Synchronization"
+          echo "=========================================="
+          echo ""
+          echo "Source:      ${SOURCE_REPO}"
+          echo "Destination: ${DEST_REPO}"
+          echo "GitHub user: ${GH_USER}"
+          echo ""
+
+          # -----------------------------------------------------
+          # Determine PR state
+          # -----------------------------------------------------
+
+          if [ "$MODE" = "open" ]; then
+            STATES="open"
+          elif [ "$MODE" = "closed" ]; then
+            STATES="closed"
+          else
+            STATES="open closed"
+          fi
+
+          # -----------------------------------------------------
+          # Process each PR state
+          # -----------------------------------------------------
+
+          for STATE in $STATES; do
+
+            echo ""
+            echo "------------------------------------------"
+            echo "Looking for ${STATE} PRs"
+            echo "------------------------------------------"
+
+            gh api \
+              --paginate \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "/repos/${SOURCE_REPO}/pulls?state=${STATE}&per_page=100" \
+              > /tmp/pr-pages.jsonl
+
+            jq -s 'add' /tmp/pr-pages.jsonl > /tmp/prs.json
+
+            TOTAL=$(jq 'length' /tmp/prs.json)
+
+            echo "Found ${TOTAL} ${STATE} PRs."
+
+            # ---------------------------------------------------
+            # Only PRs authored by YOU
+            # ---------------------------------------------------
+
+            jq -c \
+              --arg USER "${GH_USER}" \
+              '.[] | select(.user.login == $USER)' \
+              /tmp/prs.json \
+              > /tmp/my-prs.jsonl
+
+            while IFS= read -r PR; do
+
+              [ -z "$PR" ] && continue
+
+              PR_NUMBER=$(echo "$PR" | jq -r '.number')
+              PR_TITLE=$(echo "$PR" | jq -r '.title')
+              PR_BODY=$(echo "$PR" | jq -r '.body // ""')
+              PR_DRAFT=$(echo "$PR" | jq -r '.draft')
+              PR_STATE=$(echo "$PR" | jq -r '.state')
+
+              HEAD_BRANCH=$(echo "$PR" | jq -r '.head.ref')
+              BASE_BRANCH=$(echo "$PR" | jq -r '.base.ref')
+
+              HEAD_REPO=$(echo "$PR" | jq -r '.head.repo.full_name // ""')
+
+              echo ""
+              echo "=========================================="
+              echo "PR #${PR_NUMBER}"
+              echo "Title: ${PR_TITLE}"
+              echo "Branch: ${HEAD_BRANCH}"
+              echo "Base: ${BASE_BRANCH}"
+              echo "State: ${PR_STATE}"
+              echo "Draft: ${PR_DRAFT}"
+              echo "Head repo: ${HEAD_REPO}"
+              echo "=========================================="
+
+              # -------------------------------------------------
+              # Safety check
+              # -------------------------------------------------
+
+              if [ -z "$HEAD_BRANCH" ]; then
+                echo "No head branch. Skipping."
+                continue
+              fi
+
+              # -------------------------------------------------
+              # Fetch the exact PR head
+              #
+              # This preserves the original Git commits.
+              # -------------------------------------------------
+
+              echo "Fetching PR ${PR_NUMBER}..."
+
+              git fetch \
+                source \
+                "refs/pull/${PR_NUMBER}/head:refs/remotes/source/pr-${PR_NUMBER}"
+
+              SOURCE_SHA=$(git rev-parse \
+                "refs/remotes/source/pr-${PR_NUMBER}")
+
+              echo "Source commit: ${SOURCE_SHA}"
+
+              # -------------------------------------------------
+              # Check destination base branch
+              # -------------------------------------------------
+
+              if ! git ls-remote \
+                --exit-code \
+                origin \
+                "refs/heads/${BASE_BRANCH}" \
+                >/dev/null 2>&1; then
+
+                echo "Base branch ${BASE_BRANCH} does not exist in destination."
+
+                # If the base is main/master, don't create random
+                # history. Skip and report it.
+                echo "Skipping PR #${PR_NUMBER}."
+                continue
+              fi
+
+              # -------------------------------------------------
+              # Check whether destination branch exists
+              # -------------------------------------------------
+
+              DEST_SHA=$(
+                git ls-remote \
+                  origin \
+                  "refs/heads/${HEAD_BRANCH}" \
+                | awk '{print $1}'
+              )
+
+              # -------------------------------------------------
+              # Create/update destination branch
+              # -------------------------------------------------
+
+              if [ -z "$DEST_SHA" ]; then
+
+                echo "Creating destination branch:"
+                echo "  ${HEAD_BRANCH}"
+
+                git push \
+                  origin \
+                  "${SOURCE_SHA}:refs/heads/${HEAD_BRANCH}"
+
+              else
+
+                echo "Destination branch already exists."
+                echo "Destination commit: ${DEST_SHA}"
+
+                if [ "$DEST_SHA" != "$SOURCE_SHA" ]; then
+
+                  echo "Updating destination branch..."
+
+                  git push \
+                    --force-with-lease="refs/heads/${HEAD_BRANCH}:${DEST_SHA}" \
+                    origin \
+                    "${SOURCE_SHA}:refs/heads/${HEAD_BRANCH}"
+
+                else
+
+                  echo "Branch is already synchronized."
+
+                fi
+
+              fi
+
+              # -------------------------------------------------
+              # Look for an existing destination PR
+              # -------------------------------------------------
+
+              EXISTING_PR=$(
+                gh api \
+                  --paginate \
+                  "/repos/${DEST_REPO}/pulls?state=all&head=${GH_USER}:${HEAD_BRANCH}&base=${BASE_BRANCH}&per_page=100" \
+                  | jq -s 'add | .[0] // empty'
+              )
+
+              if [ -n "$EXISTING_PR" ]; then
+
+                DEST_PR_NUMBER=$(echo "$EXISTING_PR" | jq -r '.number')
+
+                echo ""
+                echo "Destination PR already exists:"
+                echo "#${DEST_PR_NUMBER}"
+
+                # -------------------------------------------------
+                # Keep title/body synchronized
+                # -------------------------------------------------
+
+                gh api \
+                  --method PATCH \
+                  "/repos/${DEST_REPO}/pulls/${DEST_PR_NUMBER}" \
+                  -f "title=${PR_TITLE}" \
+                  -f "body=${PR_BODY}" \
+                  >/dev/null
+
+                # -------------------------------------------------
+                # Draft state
+                # -------------------------------------------------
+
+                CURRENT_DRAFT=$(echo "$EXISTING_PR" | jq -r '.draft')
+
+                if [ "$PR_DRAFT" = "false" ] && [ "$CURRENT_DRAFT" = "true" ]; then
+
+                  gh api \
+                    --method PATCH \
+                    "/repos/${DEST_REPO}/pulls/${DEST_PR_NUMBER}" \
+                    -f "draft=false" \
+                    >/dev/null
+
+                fi
+
+              else
+
+                echo ""
+                echo "Creating destination PR..."
+
+                if [ "$PR_DRAFT" = "true" ]; then
+
+                  gh pr create \
+                    --repo "${DEST_REPO}" \
+                    --head "${HEAD_BRANCH}" \
+                    --base "${BASE_BRANCH}" \
+                    --title "${PR_TITLE}" \
+                    --body "${PR_BODY}" \
+                    --draft
+
+                else
+
+                  gh pr create \
+                    --repo "${DEST_REPO}" \
+                    --head "${HEAD_BRANCH}" \
+                    --base "${BASE_BRANCH}" \
+                    --title "${PR_TITLE}" \
+                    --body "${PR_BODY}"
+
+                fi
+
+              fi
+
+              echo ""
+              echo "PR #${PR_NUMBER} synchronized."
+
+            done < /tmp/my-prs.jsonl
+
+          done
+
+          echo ""
+          echo "=========================================="
+          echo "Synchronization finished."
+          echo "=========================================="
