@@ -1,0 +1,182 @@
+name: Sync My ZcashGH Work
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/59 * * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout personal repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_SYNC_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "starlabman"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add source repository
+        run: |
+          git remote add source https://github.com/ZOERDHUB/ZcashGH-Residency01.git
+          git fetch source --prune
+
+      - name: Install GitHub CLI
+        run: |
+          gh --version
+
+      - name: Sync my branches
+        env:
+          GH_TOKEN: ${{ secrets.GH_SYNC_TOKEN }}
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import subprocess
+
+          SOURCE_OWNER = "ZOERDHUB"
+          SOURCE_REPO = "ZcashGH-Residency01"
+          DEST_OWNER = "starlabman"
+          DEST_REPO = "ZcashGH-Residency01"
+          USER = "starlabman"
+
+          def gh_api(endpoint):
+              result = subprocess.run(
+                  ["gh", "api", endpoint, "--paginate"],
+                  capture_output=True,
+                  text=True,
+                  check=True
+              )
+
+              output = result.stdout.strip()
+
+              if not output:
+                  return []
+
+              try:
+                  return json.loads(output)
+              except json.JSONDecodeError:
+                  items = []
+                  for line in output.splitlines():
+                      if line.strip():
+                          items.extend(json.loads(line))
+                  return items
+
+          # Get PRs authored by starlabman
+          prs = gh_api(
+              f"repos/{SOURCE_OWNER}/{SOURCE_REPO}/pulls"
+              f"?state=all&per_page=100"
+          )
+
+          my_prs = [
+              pr for pr in prs
+              if pr.get("user", {}).get("login", "").lower() == USER.lower()
+          ]
+
+          print(f"Found {len(my_prs)} PRs authored by {USER}")
+
+          processed = set()
+
+          for pr in my_prs:
+              head = pr["head"]
+              base = pr["base"]
+
+              branch = head["ref"]
+
+              # Only synchronize branches that actually belong to us.
+              if head["user"]["login"].lower() != USER.lower():
+                  print(f"Skipping {branch}: not owned by {USER}")
+                  continue
+
+              if branch in processed:
+                  continue
+
+              processed.add(branch)
+
+              print(f"\nSyncing branch: {branch}")
+
+              # Make sure source branch exists locally.
+              subprocess.run(
+                  ["git", "fetch", "source", f"{branch}:{branch}"],
+                  check=False
+              )
+
+              # Check whether destination branch already exists.
+              remote_check = subprocess.run(
+                  [
+                      "git",
+                      "ls-remote",
+                      "--heads",
+                      "origin",
+                      branch
+                  ],
+                  capture_output=True,
+                  text=True
+              )
+
+              if remote_check.stdout.strip():
+                  print(f"Destination branch already exists: {branch}")
+
+                  subprocess.run(
+                      ["git", "push", "origin", f"{branch}:{branch}"],
+                      check=True
+                  )
+              else:
+                  print(f"Creating destination branch: {branch}")
+
+                  subprocess.run(
+                      ["git", "push", "origin", f"{branch}:{branch}"],
+                      check=True
+                  )
+
+              # Find an existing PR in destination.
+              existing = gh_api(
+                  f"repos/{DEST_OWNER}/{DEST_REPO}/pulls"
+                  f"?state=all&head={DEST_OWNER}:{branch}&per_page=100"
+              )
+
+              if existing:
+                  print(
+                      f"Destination PR already exists: "
+                      f"#{existing[0]['number']}"
+                  )
+                  continue
+
+              title = pr["title"]
+              body = pr.get("body") or ""
+              draft = pr.get("draft", False)
+
+              print(f"Creating destination PR for {branch}")
+
+              command = [
+                  "gh",
+                  "pr",
+                  "create",
+                  "--repo",
+                  f"{DEST_OWNER}/{DEST_REPO}",
+                  "--head",
+                  branch,
+                  "--base",
+                  base,
+                  "--title",
+                  title,
+                  "--body",
+                  body
+              ]
+
+              if draft:
+                  command.append("--draft")
+
+              subprocess.run(command, check=True)
+
+          print("\nSynchronization complete.")
+          PY
